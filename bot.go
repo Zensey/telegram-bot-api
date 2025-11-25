@@ -166,57 +166,72 @@ func (bot *BotAPI) decodeAPIResponse(responseBody io.Reader, resp *APIResponse) 
 
 // UploadFiles makes a request to the API with files.
 func (bot *BotAPI) UploadFiles(endpoint string, params Params, files []RequestFile) (*APIResponse, error) {
-	r, w := io.Pipe()
-	m := multipart.NewWriter(w)
 
-	// This code modified from the very helpful @HirbodBehnam
-	// https://github.com/go-telegram-bot-api/telegram-bot-api/issues/354#issuecomment-663856473
-	go func() {
-		defer w.Close()
-		defer m.Close()
+	// Generate a fixed boundary.
+	// This is necessary so that the Content-Type in the header matches the body when retrying.
+	boundary := fmt.Sprintf("----------------telegram-bot-api-%d", time.Now().UnixNano())
 
-		for field, value := range params {
-			if err := m.WriteField(field, value); err != nil {
-				w.CloseWithError(err)
-				return
-			}
+	// Define the function that creates the data stream (Body).
+	// It will be called immediately the first time, and again if Go decides to retry.
+	createBody := func() (io.ReadCloser, error) {
+		r, w := io.Pipe()
+		m := multipart.NewWriter(w)
+
+		// Важно: устанавливаем тот же самый boundary
+		if err := m.SetBoundary(boundary); err != nil {
+			return nil, fmt.Errorf("failed to set multipart boundary: %w", err)
 		}
 
-		for _, file := range files {
-			if file.Data.NeedsUpload() {
-				name, reader, err := file.Data.UploadData()
-				if err != nil {
+		// This code modified from the very helpful @HirbodBehnam
+		// https://github.com/go-telegram-bot-api/telegram-bot-api/issues/354#issuecomment-663856473
+		go func() {
+			defer w.Close()
+			defer m.Close()
+
+			for field, value := range params {
+				if err := m.WriteField(field, value); err != nil {
 					w.CloseWithError(err)
 					return
 				}
+			}
 
-				part, err := m.CreateFormFile(file.Name, name)
-				if err != nil {
-					w.CloseWithError(err)
-					return
-				}
+			for _, file := range files {
+				if file.Data.NeedsUpload() {
+					name, reader, err := file.Data.UploadData()
+					if err != nil {
+						w.CloseWithError(err)
+						return
+					}
 
-				if _, err := io.Copy(part, reader); err != nil {
-					w.CloseWithError(err)
-					return
-				}
+					part, err := m.CreateFormFile(file.Name, name)
+					if err != nil {
+						w.CloseWithError(err)
+						return
+					}
 
-				if closer, ok := reader.(io.ReadCloser); ok {
-					if err = closer.Close(); err != nil {
+					if _, err := io.Copy(part, reader); err != nil {
+						w.CloseWithError(err)
+						return
+					}
+
+					if closer, ok := reader.(io.ReadCloser); ok {
+						if err = closer.Close(); err != nil {
+							w.CloseWithError(err)
+							return
+						}
+					}
+				} else {
+					value := file.Data.SendData()
+
+					if err := m.WriteField(file.Name, value); err != nil {
 						w.CloseWithError(err)
 						return
 					}
 				}
-			} else {
-				value := file.Data.SendData()
-
-				if err := m.WriteField(file.Name, value); err != nil {
-					w.CloseWithError(err)
-					return
-				}
 			}
-		}
-	}()
+		}()
+		return r, nil
+	}
 
 	if bot.Debug {
 		log.Printf("Endpoint: %s, params: %v, with %d files\n", endpoint, params, len(files))
@@ -224,12 +239,24 @@ func (bot *BotAPI) UploadFiles(endpoint string, params Params, files []RequestFi
 
 	method := fmt.Sprintf(bot.apiEndpoint, bot.Token, endpoint)
 
-	req, err := http.NewRequest("POST", method, r)
+	// 3. Create a body for the first request
+	firstBody, err := createBody()
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", method, firstBody)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", m.FormDataContentType())
+	// 4. Manually set the Content-Type with our fixed boundary
+	// Use empty writer just for getting content type
+	em := multipart.Writer{}
+	em.SetBoundary(boundary)
+	req.Header.Set("Content-Type", em.FormDataContentType())
+
+	// 5. instruct go how to recreate req.Body for the case of HTTP/2 GOAWAY
+	req.GetBody = createBody
 
 	resp, err := bot.Client.Do(req)
 	if err != nil {
